@@ -1,0 +1,1221 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Disaster Data Harvesting - ICPAC Presentation</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #1a1a2e;
+            color: white;
+            overflow: hidden;
+            print-color-adjust: exact;
+            -webkit-print-color-adjust: exact;
+        }
+
+        .presentation-wrapper {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .slide {
+            display: none;
+            width: 100%;
+            height: 100vh;
+            padding: 60px;
+            position: relative;
+            background-size: cover;
+            background-position: center;
+            page-break-after: always;
+            animation: fadeIn 0.8s ease-in-out;
+        }
+
+        .slide.active {
+            display: flex;
+            flex-direction: column;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* PowerPoint-style layouts */
+        .slide-header {
+            text-align: center;
+            margin-bottom: 40px;
+            z-index: 10;
+        }
+
+        .slide-title {
+            font-size: 3.5em;
+            font-weight: 800;
+            margin-bottom: 15px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+            background: linear-gradient(135deg, #ff6b6b, #4ecdc4, #45b7d1, #96ceb4);
+            background-size: 300% 300%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: gradientShift 3s ease infinite;
+        }
+
+        @keyframes gradientShift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        .slide-subtitle {
+            font-size: 1.5em;
+            font-weight: 300;
+            opacity: 0.9;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+        }
+
+        /* Title slide */
+        .title-slide {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            text-align: center;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .logo-container {
+            margin-bottom: 40px;
+        }
+
+        .logo {
+            width: 180px;
+            height: 180px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 5em;
+            margin: 0 auto;
+            backdrop-filter: blur(20px);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            animation: pulse 2s infinite;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
+            50% { transform: scale(1.05); box-shadow: 0 25px 50px rgba(0,0,0,0.4); }
+        }
+
+        .subtitle-info {
+            margin-top: 30px;
+            font-size: 1.2em;
+            opacity: 0.8;
+        }
+
+        /* Content slides */
+        .slide-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        /* Stats grid for slide 2 */
+        .overview-slide {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 40px;
+            margin-top: 50px;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 20px;
+            padding: 40px 30px;
+            text-align: center;
+            transition: transform 0.3s ease;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+        }
+
+        .stat-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 25px 50px rgba(0,0,0,0.3);
+        }
+
+        .stat-number {
+            font-size: 4em;
+            font-weight: 800;
+            color: #ffd93d;
+            margin-bottom: 15px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .stat-label {
+            font-size: 1.3em;
+            font-weight: 600;
+            opacity: 0.9;
+        }
+
+        /* Process flow for slide 3 */
+        .process-slide {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            color: #2c3e50;
+        }
+
+        .process-flow {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 30px;
+            margin-top: 40px;
+        }
+
+        .process-step {
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 20px;
+            padding: 30px 20px;
+            text-align: center;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            position: relative;
+            transition: transform 0.3s ease;
+        }
+
+        .process-step:hover {
+            transform: translateY(-5px);
+        }
+
+        .process-step:not(:last-child)::after {
+            content: '→';
+            position: absolute;
+            right: -25px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 2.5em;
+            color: #667eea;
+            font-weight: bold;
+            z-index: 10;
+        }
+
+        .process-icon {
+            font-size: 4em;
+            margin-bottom: 20px;
+            display: block;
+        }
+
+        .process-step h3 {
+            font-size: 1.4em;
+            margin-bottom: 15px;
+            color: #2c3e50;
+            font-weight: 700;
+        }
+
+        .process-step p {
+            font-size: 1em;
+            opacity: 0.8;
+            line-height: 1.4;
+        }
+
+        /* Technology slide */
+        .tech-slide {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .tech-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 40px;
+            margin-top: 40px;
+        }
+
+        .tech-section {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 40px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+        }
+
+        .tech-section h3 {
+            font-size: 1.8em;
+            margin-bottom: 25px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .tech-list {
+            list-style: none;
+        }
+
+        .tech-list li {
+            padding: 12px 0;
+            font-size: 1.1em;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .tech-list li:last-child {
+            border-bottom: none;
+        }
+
+        .tech-list li::before {
+            content: '⚡';
+            margin-right: 15px;
+            font-size: 1.3em;
+        }
+
+        /* Impact slide */
+        .impact-slide {
+            background: linear-gradient(135deg, #ff9a9e 0%, #fecfef 100%);
+            color: #2c3e50;
+        }
+
+        .impact-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 50px;
+            margin-top: 60px;
+        }
+
+        .impact-card {
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 25px;
+            padding: 40px 30px;
+            text-align: center;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+            transition: transform 0.3s ease;
+        }
+
+        .impact-card:hover {
+            transform: scale(1.05);
+        }
+
+        .impact-number {
+            font-size: 4em;
+            font-weight: 800;
+            color: #667eea;
+            margin-bottom: 15px;
+        }
+
+        .impact-label {
+            font-size: 1.3em;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .impact-quote {
+            text-align: center;
+            margin-top: 60px;
+            font-size: 1.5em;
+            font-weight: 600;
+            color: #2c3e50;
+            font-style: italic;
+        }
+
+        /* Challenges slide */
+        .challenges-slide {
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            color: #2c3e50;
+        }
+
+        .challenges-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 40px;
+            margin-top: 40px;
+        }
+
+        .challenge-card {
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 20px;
+            padding: 35px;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.1);
+            border-left: 6px solid #ff6b6b;
+            transition: transform 0.3s ease;
+        }
+
+        .challenge-card:hover {
+            transform: translateX(10px);
+        }
+
+        .challenge-card h3 {
+            color: #ff6b6b;
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .challenge-detail {
+            margin-bottom: 15px;
+        }
+
+        .challenge-detail strong {
+            color: #2c3e50;
+            font-weight: 700;
+        }
+
+        /* Future slide */
+        .future-slide {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .future-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 40px;
+            margin-top: 40px;
+        }
+
+        .future-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 40px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+            transition: all 0.3s ease;
+        }
+
+        .future-card:hover {
+            transform: scale(1.05);
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .future-card h3 {
+            font-size: 1.6em;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        /* Navigation and controls */
+        .slide-controls {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 20px;
+            z-index: 1000;
+        }
+
+        .control-btn {
+            padding: 15px 30px;
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50px;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 1em;
+        }
+
+        .control-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-3px);
+            box-shadow: 0 15px 30px rgba(0,0,0,0.3);
+        }
+
+        .slide-indicators {
+            position: fixed;
+            right: 30px;
+            top: 50%;
+            transform: translateY(-50%);
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            z-index: 1000;
+        }
+
+        .indicator {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.4);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+
+        .indicator.active {
+            background: white;
+            transform: scale(1.3);
+            border: 2px solid rgba(255, 255, 255, 0.5);
+        }
+
+        .slide-number {
+            position: absolute;
+            top: 30px;
+            right: 30px;
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(10px);
+            padding: 15px 25px;
+            border-radius: 30px;
+            font-weight: 600;
+            font-size: 1.1em;
+        }
+
+        /* Export button */
+        .export-controls {
+            position: fixed;
+            top: 30px;
+            left: 30px;
+            z-index: 1000;
+        }
+
+        .export-btn {
+            padding: 12px 25px;
+            background: rgba(255, 255, 255, 0.9);
+            color: #2c3e50;
+            border: none;
+            border-radius: 25px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-right: 10px;
+            font-size: 0.9em;
+        }
+
+        .export-btn:hover {
+            background: white;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        /* Print styles for PDF export */
+        @media print {
+            body { background: white !important; }
+            .slide { 
+                display: block !important;
+                height: 100vh;
+                page-break-after: always;
+            }
+            .slide-controls, .slide-indicators, .export-controls { display: none !important; }
+        }
+
+        /* Responsive design */
+        @media (max-width: 1200px) {
+            .slide { padding: 40px; }
+            .slide-title { font-size: 2.8em; }
+            .stats-container, .tech-grid, .challenges-grid { grid-template-columns: 1fr; }
+            .process-flow { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        @media (max-width: 768px) {
+            .slide { padding: 20px; }
+            .slide-title { font-size: 2.2em; }
+            .process-flow, .future-grid, .impact-metrics { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html" style="cursor: default;">
+    <div class="presentation-wrapper">
+        <!-- Export Controls -->
+        <div class="export-controls">
+            <button class="export-btn" onclick="exportToPDF()">📄 Save as PDF</button>
+            <button class="export-btn" onclick="exportAsHTML()">💾 Download HTML</button>
+            <button class="export-btn" onclick="toggleFullscreen()">🔍 Fullscreen</button>
+        </div>
+
+        <!-- Slide 1: Title -->
+        <div class="slide title-slide" style="display: flex;">
+            <div class="slide-number">1/8</div>
+            <div class="slide-content">
+                <div class="logo-container">
+                    <div class="logo">🌍</div>
+                </div>
+                <h1 class="slide-title">Web Disaster Data Harvesting</h1>
+                <p class="slide-subtitle">Automated Intelligence for Humanitarian Response</p>
+                <div class="subtitle-info">
+                    <p style="font-size: 1.3em; margin-bottom: 10px;">ICPAC</p>
+                    <p style="opacity: 0.8;">Intergovernmental Authority on Development</p>
+                    <p style="opacity: 0.7;">Climate Prediction and Applications Centre</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 2: Overview -->
+        <div class="slide overview-slide" style="display: flex;">
+            <div class="slide-number">2/8</div>
+            <div class="slide-header">
+                <h1 class="slide-title">The Challenge We Face</h1>
+                <p class="slide-subtitle">Disasters don't wait. Neither should our response.</p>
+            </div>
+            <div class="slide-content">
+                <div class="stats-container">
+                    <div class="stat-card" style="transform: scale(1) translateY(0px); transition: transform 0.3s;">
+                        <div class="stat-number">11</div>
+                        <div class="stat-label">ICPAC Countries</div>
+                    </div>
+                    <div class="stat-card" style="transform: scale(1) translateY(0px); transition: transform 0.3s;">
+                        <div class="stat-number">24/7</div>
+                        <div class="stat-label">Continuous Monitoring</div>
+                    </div>
+                    <div class="stat-card" style="transform: scale(1) translateY(0px); transition: transform 0.3s;">
+                        <div class="stat-number">∞</div>
+                        <div class="stat-label">Data Sources</div>
+                    </div>
+                </div>
+                <p style="text-align: center; margin-top: 50px; font-size: 1.4em; font-weight: 600;">
+                    Real-time disaster intelligence across Eastern Africa's most vulnerable regions
+                </p>
+            </div>
+        </div>
+
+        <!-- Slide 3: Data Sources -->
+        <div class="slide process-slide" style="display: flex;">
+            <div class="slide-number">3/8</div>
+            <div class="slide-header">
+                <h1 class="slide-title">Multi-Source Data Harvesting</h1>
+                <p class="slide-subtitle">Comprehensive intelligence gathering from diverse channels</p>
+            </div>
+            <div class="slide-content">
+                <div class="process-flow">
+                    <div class="process-step">
+                        <div class="process-icon">📡</div>
+                        <h3>RSS Feeds</h3>
+                        <p>ReliefWeb updates, news alerts, and humanitarian reports</p>
+                    </div>
+                    <div class="process-step">
+                        <div class="process-icon">🔌</div>
+                        <h3>API Integration</h3>
+                        <p>Real-time disaster data from ReliefWeb's comprehensive database</p>
+                    </div>
+                    <div class="process-step">
+                        <div class="process-icon">🗄️</div>
+                        <h3>Database Storage</h3>
+                        <p>PostgreSQL for robust data persistence and analytics</p>
+                    </div>
+                    <div class="process-step" style="transform: scale(1) translateY(0px); transition: transform 0.3s;">
+                        <div class="process-icon">📊</div>
+                        <h3>Intelligence Reports</h3>
+                        <p>Automated Excel reports and email distribution</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 4: Technology Stack -->
+        <div class="slide tech-slide" style="display: flex;">
+            <div class="slide-number">4/8</div>
+            <div class="slide-header">
+                <h1 class="slide-title">Cutting-Edge Technology Stack</h1>
+                <p class="slide-subtitle">Built for reliability, scalability, and speed</p>
+            </div>
+            <div class="slide-content">
+                <div class="tech-grid">
+                    <div class="tech-section">
+                        <h3>🐍 Core Technologies</h3>
+                        <ul class="tech-list">
+                            <li>Python 3.x - Robust automation</li>
+                            <li>PostgreSQL - Enterprise database</li>
+                            <li>Pandas - Advanced data processing</li>
+                            <li>Requests - HTTP client with retry logic</li>
+                        </ul>
+                    </div>
+                    <div class="tech-section" style="transform: scale(1) translateY(0px); transition: transform 0.3s;">
+                        <h3>⚡ Advanced Features</h3>
+                        <ul class="tech-list">
+                            <li>Smart retry mechanisms</li>
+                            <li>Automated deduplication</li>
+                            <li>Email threading &amp; tracking</li>
+                            <li>Error logging &amp; monitoring</li>
+                        </ul>
+                    </div>
+                    <div class="tech-section">
+                        <h3>🔒 Security &amp; Reliability</h3>
+                        <ul class="tech-list">
+                            <li>Environment-based configuration</li>
+                            <li>Connection pooling</li>
+                            <li>Graceful error handling</li>
+                            <li>Comprehensive logging</li>
+                        </ul>
+                    </div>
+                    <div class="tech-section">
+                        <h3>📈 Data Intelligence</h3>
+                        <ul class="tech-list">
+                            <li>Real-time data aggregation</li>
+                            <li>Smart country detection</li>
+                            <li>Automated report generation</li>
+                            <li>Multi-sheet Excel exports</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5: Impact & Results -->
+        <div class="slide impact-slide" style="display: flex;">
+            <div class="slide-number">5/8</div>
+            <div class="slide-header">
+                <h1 class="slide-title">Measurable Impact</h1>
+                <p class="slide-subtitle">Transforming disaster response through data automation</p>
+            </div>
+            <div class="slide-content">
+                <div class="impact-metrics">
+                    <div class="impact-card">
+                        <div class="impact-number">95%</div>
+                        <div class="impact-label">Faster Data Collection</div>
+                    </div>
+                    <div class="impact-card">
+                        <div class="impact-number">100%</div>
+                        <div class="impact-label">Coverage of ICPAC Region</div>
+                    </div>
+                    <div class="impact-card">
+                        <div class="impact-number">24/7</div>
+                        <div class="impact-label">Automated Monitoring</div>
+                    </div>
+                </div>
+                <div class="impact-quote">
+                    "From hours to minutes: Revolutionizing humanitarian intelligence"
+                </div>
+                <p style="text-align: center; margin-top: 30px; font-size: 1.2em; opacity: 0.8;">
+                    Enabling faster response times and better-informed decision making across Eastern Africa
+                </p>
+            </div>
+        </div>
+
+        <!-- Slide 6: Challenges & Solutions -->
+        <div class="slide challenges-slide" style="display: flex;">
+            <div class="slide-number">6/8</div>
+            <div class="slide-header">
+                <h1 class="slide-title">Challenges Overcome</h1>
+                <p class="slide-subtitle">Engineering solutions for complex humanitarian data challenges</p>
+            </div>
+            <div class="slide-content">
+                <div class="challenges-grid">
+                    <div class="challenge-card">
+                        <h3>🌐 Data Source Reliability</h3>
+                        <div class="challenge-detail">
+                            <strong>Challenge:</strong> Inconsistent API availability and network issues
+                        </div>
+                        <div class="challenge-detail">
+                            <strong>Solution:</strong> Intelligent retry mechanisms with exponential backoff
+                        </div>
+                    </div>
+                    <div class="challenge-card">
+                        <h3>🔄 Data Duplication</h3>
+                        <div class="challenge-detail">
+                            <strong>Challenge:</strong> Preventing duplicate entries across multiple runs
+                        </div>
+                        <div class="challenge-detail">
+                            <strong>Solution:</strong> Smart deduplication using unique identifiers and URLs
+                        </div>
+                    </div>
+                    <div class="challenge-card">
+                        <h3>📊 Data Quality</h3>
+                        <div class="challenge-detail">
+                            <strong>Challenge:</strong> Inconsistent data formats from different sources
+                        </div>
+                        <div class="challenge-detail">
+                            <strong>Solution:</strong> Robust parsing and validation with error handling
+                        </div>
+                    </div>
+                    <div class="challenge-card">
+                        <h3>⚡ Performance at Scale</h3>
+                        <div class="challenge-detail">
+                            <strong>Challenge:</strong> Processing large volumes of data efficiently
+                        </div>
+                        <div class="challenge-detail">
+                            <strong>Solution:</strong> Optimized database operations and batch processing
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 7: Future Enhancements -->
+        <div class="slide future-slide" style="display: flex;">
+            <div class="slide-number">7/8</div>
+            <div class="slide-header">
+                <h1 class="slide-title">Future Innovations</h1>
+                <p class="slide-subtitle">Next-generation enhancements for smarter disaster intelligence</p>
+            </div>
+            <div class="slide-content">
+                <div class="future-grid">
+                    <div class="future-card">
+                        <h3>🤖 AI-Powered Analysis</h3>
+                        <p>Machine learning for disaster severity prediction and trend analysis</p>
+                    </div>
+                    <div class="future-card">
+                        <h3>📱 Real-time Alerts</h3>
+                        <p>Instant SMS and mobile notifications for critical disaster events</p>
+                    </div>
+                    <div class="future-card">
+                        <h3>🗺️ GIS Integration</h3>
+                        <p>Geographic mapping and spatial analysis of disaster patterns</p>
+                    </div>
+                    <div class="future-card">
+                        <h3>☁️ Cloud Deployment</h3>
+                        <p>Scalable cloud infrastructure for global disaster monitoring</p>
+                    </div>
+                </div>
+                <p style="text-align: center; margin-top: 50px; font-size: 1.3em; font-weight: 600;">
+                    Building tomorrow's disaster response capabilities today
+                </p>
+            </div>
+        </div>
+
+        <!-- Slide 8: Thank You -->
+        <div class="slide title-slide active" style="display: flex;">
+            <div class="slide-number">8/8</div>
+            <div class="slide-content">
+                <div class="logo-container">
+                    <div class="logo">🚀</div>
+                </div>
+                <h1 class="slide-title">Thank You</h1>
+                <p class="slide-subtitle">Questions &amp; Discussion</p>
+                <div style="margin-top: 50px;">
+                    <p style="font-size: 1.4em; margin-bottom: 15px; font-weight: 600;">Mark Lelaono</p>
+                    <p style="opacity: 0.8; font-size: 1.1em;">mlelaono@icpac.net</p>
+                    <p style="opacity: 0.8; margin-top: 25px; font-size: 1.1em;">ICPAC - Climate Prediction and Applications Centre</p>
+                </div>
+                <p style="margin-top: 60px; font-size: 1.2em; opacity: 0.7; font-style: italic;">
+                    "Empowering humanitarian response through intelligent data harvesting"
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Navigation Controls -->
+    <div class="slide-controls">
+        <button class="control-btn" onclick="previousSlide()">← Previous</button>
+        <button class="control-btn" onclick="nextSlide()">Next →</button>
+    </div>
+
+    <!-- Slide Indicators -->
+    <div class="slide-indicators">
+        <div class="indicator" onclick="goToSlide(0)" title="Title"></div>
+        <div class="indicator" onclick="goToSlide(1)" title="Challenge"></div>
+        <div class="indicator" onclick="goToSlide(2)" title="Data Sources"></div>
+        <div class="indicator" onclick="goToSlide(3)" title="Technology"></div>
+        <div class="indicator" onclick="goToSlide(4)" title="Impact"></div>
+        <div class="indicator" onclick="goToSlide(5)" title="Challenges"></div>
+        <div class="indicator" onclick="goToSlide(6)" title="Future"></div>
+        <div class="indicator active" onclick="goToSlide(7)" title="Thank You"></div>
+    </div>
+
+    <script>
+        let currentSlide = 0;
+        const slides = document.querySelectorAll('.slide');
+        const indicators = document.querySelectorAll('.indicator');
+        const totalSlides = slides.length;
+
+        function updateSlide() {
+            slides.forEach((slide, index) => {
+                slide.classList.toggle('active', index === currentSlide);
+            });
+            
+            indicators.forEach((indicator, index) => {
+                indicator.classList.toggle('active', index === currentSlide);
+            });
+        }
+
+        function nextSlide() {
+            currentSlide = (currentSlide + 1) % totalSlides;
+            updateSlide();
+        }
+
+        function previousSlide() {
+            currentSlide = (currentSlide - 1 + totalSlides) % totalSlides;
+            updateSlide();
+        }
+
+        function goToSlide(index) {
+            currentSlide = index;
+            updateSlide();
+        }
+
+        // Export functions
+        function exportToPDF() {
+            // Show all slides for printing
+            slides.forEach(slide => slide.style.display = 'flex');
+            
+            // Trigger print dialog
+            window.print();
+            
+            // Restore single slide view after print
+            setTimeout(() => {
+                updateSlide();
+            }, 1000);
+        }
+
+        function exportAsHTML() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'disaster-data-harvesting-presentation.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(err => {
+                    console.log(`Error attempting to enable fullscreen: ${err.message}`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            switch(e.key) {
+                case 'ArrowRight':
+                case ' ':
+                case 'PageDown':
+                    e.preventDefault();
+                    nextSlide();
+                    break;
+                case 'ArrowLeft':
+                case 'PageUp':
+                    e.preventDefault();
+                    previousSlide();
+                    break;
+                case 'Home':
+                    e.preventDefault();
+                    goToSlide(0);
+                    break;
+                case 'End':
+                    e.preventDefault();
+                    goToSlide(totalSlides - 1);
+                    break;
+                case 'F11':
+                    e.preventDefault();
+                    toggleFullscreen();
+                    break;
+            }
+            
+            // Number keys 1-8 for direct slide navigation
+            if (e.key >= '1' && e.key <= '8') {
+                e.preventDefault();
+                goToSlide(parseInt(e.key) - 1);
+            }
+        });
+
+        // Touch/swipe support for mobile
+        let touchStartX = 0;
+        let touchEndX = 0;
+
+        document.addEventListener('touchstart', e => {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+
+        document.addEventListener('touchend', e => {
+            touchEndX = e.changedTouches[0].screenX;
+            handleSwipe();
+        });
+
+        function handleSwipe() {
+            const swipeThreshold = 50;
+            const diff = touchStartX - touchEndX;
+            
+            if (Math.abs(diff) > swipeThreshold) {
+                if (diff > 0) {
+                    nextSlide(); // Swipe left = next slide
+                } else {
+                    previousSlide(); // Swipe right = previous slide
+                }
+            }
+        }
+
+        // Auto-advance slides (optional - currently disabled)
+        // setInterval(nextSlide, 10000);
+
+        // Initialize presentation
+        updateSlide();
+
+        // Add hover effects to interactive elements
+        document.querySelectorAll('.stat-card, .process-step, .future-card, .impact-card, .challenge-card, .tech-section').forEach(element => {
+            element.addEventListener('mouseenter', function() {
+                this.style.transform = 'scale(1.02) translateY(-2px)';
+                this.style.transition = 'transform 0.3s ease';
+            });
+            
+            element.addEventListener('mouseleave', function() {
+                this.style.transform = 'scale(1) translateY(0)';
+            });
+        });
+
+        // Presentation timer (optional)
+        let startTime = Date.now();
+        function updateTimer() {
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            const minutes = Math.floor(elapsed / 60);
+            const seconds = elapsed % 60;
+            // You can display this timer somewhere if needed
+            // console.log(`${minutes}:${seconds.toString().padStart(2, '0')}`);
+        }
+        setInterval(updateTimer, 1000);
+
+        // Prevent context menu on right click for cleaner presentation
+        document.addEventListener('contextmenu', e => e.preventDefault());
+
+        // Hide mouse cursor after inactivity (for presentation mode)
+        let mouseTimer;
+        function hideCursor() {
+            document.body.style.cursor = 'none';
+        }
+        
+        function showCursor() {
+            document.body.style.cursor = 'default';
+            clearTimeout(mouseTimer);
+            mouseTimer = setTimeout(hideCursor, 3000); // Hide after 3 seconds
+        }
+        
+        document.addEventListener('mousemove', showCursor);
+        
+        // Initialize cursor hiding
+        mouseTimer = setTimeout(hideCursor, 3000);
+    </script>
+
+</body></html>
